@@ -48,7 +48,8 @@ Your answers: object detection must work on day one; accuracy = mAP50-95 / mAP50
 6. **Task evaluators** (`TaskEvaluator` base: `evaluate(adapter, dataset) -> EvalResult`)
    - `DetectionEvaluator` (implemented): a timed pass at `CONF_THRESHOLD` (the deployment setting) that feeds `Precision`, `Recall`, `F1Score`, then an untimed pass at a very low confidence for mAP (`sv.metrics.MeanAveragePrecision`). Both models go through this identical scorer, so the numbers are comparable.
    - `SegmentationEvaluator` (implemented, added after the first version): subclasses `DetectionEvaluator`, reads mask annotations, scores IoU on masks (mask mAP, precision, recall, F1) and also reports box mAP50-95. Masks are stored run-length encoded (`sv.CompactMask`) to keep memory down.
-   - `pose`, `keypoint`, `classification`: registered as named stubs that raise a clear "not implemented yet, add it here" message. Pose reuses the same loop when added later (keypoint targets); classification needs top-1/top-5 and a folder-per-class loader.
+   - `KeypointEvaluator` (implemented, added later; `pose` is an alias): own YOLO-pose and COCO-keypoints loaders, and a COCO-style OKS scorer (`OksScorer`) for keypoint mAP50-95, mAP50, precision, recall and F1, because supervision has no keypoint metric.
+   - `classification`: registered as a named stub that raises a clear "not implemented yet, add it here" message; it needs top-1/top-5 and a folder-per-class loader.
 
 7. **Timing** (shared by every task)
    - Image is loaded into memory first; the clock wraps only the `predict` call, batch 1, with `torch.cuda.synchronize()` on GPU, after `WARMUP_RUNS` discarded runs.

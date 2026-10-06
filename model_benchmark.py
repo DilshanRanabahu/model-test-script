@@ -54,6 +54,8 @@ class ModelSpec:
                     any         images_dir, labels_dir  override where images / YOLO labels are read from
                                 class_names             list of class names if the weights do not carry them
                                 allow_download          True lets the library fetch pretrained weights by name
+                                kpt_sigmas              per-keypoint OKS sigmas for keypoint tasks (default: the COCO
+                                                        values for 17 keypoints, otherwise 1 / number of keypoints)
                     yolo        imgsz                   inference image size
                     rfdetr      variant                 class name, e.g. "RFDETRNano", if it cannot be inferred
                                 resolution              inference resolution
@@ -74,7 +76,7 @@ class ModelSpec:
 # USER SETTINGS - edit this block
 # ======================================================================================================
 
-TASK = "segmentation"  # "detection" or "segmentation"; "pose", "keypoint", "classification" are extension points
+TASK = "keypoint"  # "detection", "segmentation", "keypoint" (same as "pose"); "classification" is an extension point
 BENCHMARK = True  # True: evaluate every model in MODELS and draw the comparison chart. False: SINGLE_MODEL only
 
 # Trial setup: pretrained nano models on the small Ultralytics sample datasets (4 test images each).
@@ -87,6 +89,8 @@ COCO8_YAML = SAMPLE_YAMLS + r"\coco8.yaml"
 COCO8_DIRS = {"images_dir": SAMPLES + r"\coco8\images\val", "labels_dir": SAMPLES + r"\coco8\labels\val"}
 COCO8_SEG_YAML = SAMPLE_YAMLS + r"\coco8-seg.yaml"
 COCO8_SEG_DIRS = {"images_dir": SAMPLES + r"\coco8-seg\images\val", "labels_dir": SAMPLES + r"\coco8-seg\labels\val"}
+COCO8_POSE_YAML = SAMPLE_YAMLS + r"\coco8-pose.yaml"
+COCO8_POSE_DIRS = {"images_dir": SAMPLES + r"\coco8-pose\images\val", "labels_dir": SAMPLES + r"\coco8-pose\labels\val"}
 
 DETECTION_MODELS = [
     ModelSpec(
@@ -126,7 +130,27 @@ SEGMENTATION_MODELS = [
     ),
 ]
 
-MODELS = SEGMENTATION_MODELS if TASK == "segmentation" else DETECTION_MODELS  # follows TASK automatically
+KEYPOINT_MODELS = [
+    ModelSpec(
+        name="YOLO11n-pose",
+        architecture="yolo",
+        weights="yolo11n-pose.pt",
+        data_path=COCO8_POSE_YAML,
+        data_format="yolo",
+        options={"allow_download": True, **COCO8_POSE_DIRS},
+    ),
+    ModelSpec(
+        name="RF-DETR Keypoint",
+        architecture="rfdetr",
+        weights=ROBOFLOW_WEIGHTS + r"\rf-detr-keypoint-preview-xlarge.pth",
+        data_path=COCO8_POSE_YAML,
+        data_format="yolo",
+        options={"variant": "RFDETRKeypointPreview", **COCO8_POSE_DIRS},
+    ),
+]
+
+# MODELS follows TASK automatically.
+MODELS = {"segmentation": SEGMENTATION_MODELS, "keypoint": KEYPOINT_MODELS, "pose": KEYPOINT_MODELS}.get(TASK, DETECTION_MODELS)
 
 SINGLE_MODEL = MODELS[0].name  # name of the model to run when BENCHMARK is False
 
@@ -353,7 +377,7 @@ def check_dependencies(architectures: set[str], need_plot: bool) -> None:
 # ======================================================================================================
 
 ARCHITECTURES: dict[str, type[ModelAdapter]] = {}
-DATA_FORMATS: dict[str, Callable[..., Any]] = {}  # loader(spec, masks=False) -> dataset
+DATA_FORMATS: dict[str, Callable[..., Any]] = {}  # loader(spec, task) -> dataset
 TASKS: dict[str, type[TaskEvaluator]] = {}
 
 
@@ -383,6 +407,64 @@ def register_task(name: str):
 
 class ConfigError(Exception):
     """A problem with the settings that the user can fix (bad path, unknown name, unsupported task)."""
+
+
+KEYPOINT_TASKS = {"keypoint", "pose"}  # two names for the same task
+
+
+@dataclass
+class KeypointSet:
+    """The keypoint instances of one image: the common type for keypoint predictions and ground truth.
+
+    xy:       (N, K, 2) pixel coordinates.
+    class_id: (N,) class index.
+    visible:  (N, K) True where a keypoint is labelled (ground truth) or predicted.
+    score:    (N,) instance confidence; predictions only.
+    area:     (N,) object area in pixels, the scale used by OKS; ground truth only.
+    names:    (N,) class name per instance, when the model reports them.
+    """
+
+    xy: Any
+    class_id: Any
+    visible: Any
+    score: Any = None
+    area: Any = None
+    names: Any = None
+
+    def __len__(self) -> int:
+        return len(self.xy)
+
+    @property
+    def data(self) -> dict:
+        return {} if self.names is None else {"class_name": self.names}
+
+    def __getitem__(self, keep) -> KeypointSet:
+        def pick(values):
+            return None if values is None else values[keep]
+
+        return KeypointSet(self.xy[keep], self.class_id[keep], self.visible[keep], pick(self.score), pick(self.area), pick(self.names))
+
+    @classmethod
+    def empty(cls, num_keypoints: int = 0) -> KeypointSet:
+        import numpy as np
+
+        return cls(
+            xy=np.zeros((0, num_keypoints, 2), dtype=np.float32),
+            class_id=np.zeros(0, dtype=int),
+            visible=np.zeros((0, num_keypoints), dtype=bool),
+            score=np.zeros(0, dtype=np.float32),
+            area=np.zeros(0, dtype=np.float32),
+        )
+
+
+@dataclass
+class KeypointDataset:
+    """A keypoint test set, shaped like supervision's DetectionDataset so the evaluators can treat both alike."""
+
+    classes: list[str]
+    image_paths: list[str]
+    annotations: dict[str, KeypointSet]
+    sigmas: Any  # (K,) per-keypoint OKS sigmas
 
 
 # ======================================================================================================
@@ -448,6 +530,15 @@ class ModelAdapter(ABC):
         raise ConfigError(f"[{self.spec.name}] weights file not found: {self.spec.weights}")
 
 
+def _object_array(values):
+    """A 1-D numpy array of Python objects (class names), so it can be filtered with a boolean mask."""
+    import numpy as np
+
+    array = np.empty(len(values), dtype=object)
+    array[:] = list(values)
+    return array
+
+
 @register_architecture("yolo")
 class YoloAdapter(ModelAdapter):
     supported_tasks = {"detection", "segmentation", "pose", "keypoint", "classification"}
@@ -473,7 +564,25 @@ class YoloAdapter(ModelAdapter):
     def to_output(self, raw):
         import supervision as sv
 
-        return sv.Detections.from_ultralytics(raw)
+        if self.task not in KEYPOINT_TASKS:
+            return sv.Detections.from_ultralytics(raw)
+        if raw.keypoints is None:
+            raise ConfigError(
+                f"[{self.spec.name}] the model returned no keypoints. Task '{self.task}' needs pose weights "
+                f"(for example a YOLO '-pose' model)."
+            )
+        if len(raw.boxes) == 0:
+            return KeypointSet.empty()
+        xy = raw.keypoints.xy.cpu().numpy()
+        confidence = raw.keypoints.conf
+        class_id = raw.boxes.cls.cpu().numpy().astype(int)
+        return KeypointSet(
+            xy=xy,
+            class_id=class_id,
+            visible=(confidence.cpu().numpy() > 0) if confidence is not None else (xy != 0).any(axis=-1),
+            score=raw.boxes.conf.cpu().numpy(),
+            names=_object_array([raw.names[int(index)] for index in class_id]),
+        )
 
     def forward_ms(self, raw) -> float | None:
         return float(raw.speed["inference"])
@@ -481,7 +590,7 @@ class YoloAdapter(ModelAdapter):
 
 @register_architecture("rfdetr")
 class RFDETRAdapter(ModelAdapter):
-    supported_tasks = {"detection", "segmentation", "keypoint"}
+    supported_tasks = {"detection", "segmentation", "keypoint", "pose"}
 
     def load(self) -> None:
         import rfdetr
@@ -520,7 +629,25 @@ class RFDETRAdapter(ModelAdapter):
         return self.model.predict(prepared, **kwargs)
 
     def to_output(self, raw):
-        return raw  # already sv.Detections
+        import supervision as sv
+
+        if self.task not in KEYPOINT_TASKS:
+            return raw  # already sv.Detections
+        if not isinstance(raw, sv.KeyPoints):
+            raise ConfigError(
+                f"[{self.spec.name}] the model returned no keypoints. Task '{self.task}' needs an RF-DETR keypoint "
+                f"checkpoint (for example the RFDETRKeypointPreview variant)."
+            )
+        if len(raw.xy) == 0:
+            return KeypointSet.empty()
+        names = raw.data.get("class_name")
+        return KeypointSet(
+            xy=raw.xy,
+            class_id=raw.class_id,
+            visible=raw.visible if raw.visible is not None else (raw.xy != 0).any(axis=-1),
+            score=raw.detection_confidence,
+            names=None if names is None else _object_array(names),
+        )
 
 
 # ======================================================================================================
@@ -536,8 +663,8 @@ def _existing_dir(candidates: list[Path]) -> Path | None:
 
 
 @register_data_format("yolo")
-def load_yolo_dataset(spec: ModelSpec, masks: bool = False):
-    """YOLO layout: data.yaml + images/ + labels/ (one .txt per image). masks=True reads the polygons as masks."""
+def load_yolo_dataset(spec: ModelSpec, task: str = "detection"):
+    """YOLO layout: data.yaml + images/ + labels/ (one .txt per image); the task decides how the labels are read."""
     import supervision as sv
     import yaml
 
@@ -589,6 +716,8 @@ def load_yolo_dataset(spec: ModelSpec, masks: bool = False):
         names = [names[key] for key in sorted(names)]
     if not names:
         raise ConfigError(f"[{spec.name}] data.yaml has no 'names' list: {yaml_path}")
+    if task in KEYPOINT_TASKS:
+        return _load_yolo_keypoints(spec, config, Path(images_dir), Path(labels_dir), [str(name) for name in names])
     with tempfile.TemporaryDirectory() as folder:
         clean_yaml = Path(folder) / "data.yaml"
         clean_yaml.write_text(yaml.safe_dump({"nc": len(names), "names": [str(name) for name in names]}), encoding="ascii")
@@ -596,12 +725,115 @@ def load_yolo_dataset(spec: ModelSpec, masks: bool = False):
             images_directory_path=str(images_dir),
             annotations_directory_path=str(labels_dir),
             data_yaml_path=str(clean_yaml),
-            force_masks=masks,
+            force_masks=task == "segmentation",
         )
 
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+COCO_KEYPOINT_SIGMAS = [0.026, 0.025, 0.025, 0.035, 0.035, 0.079, 0.079, 0.072, 0.072, 0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089]  # fmt: skip
+BOX_TO_OBJECT_AREA = 0.53  # OKS wants the object's area; without a mask, COCO-style tools estimate it from the box
+
+
+def _keypoint_sigmas(spec: ModelSpec, num_keypoints: int):
+    import numpy as np
+
+    sigmas = spec.options.get("kpt_sigmas")
+    if sigmas is None:
+        sigmas = COCO_KEYPOINT_SIGMAS if num_keypoints == 17 else [1.0 / num_keypoints] * num_keypoints
+    if len(sigmas) != num_keypoints:
+        raise ConfigError(f"[{spec.name}] kpt_sigmas has {len(sigmas)} values but the data has {num_keypoints} keypoints")
+    return np.asarray(sigmas, dtype=np.float64)
+
+
+def _load_yolo_keypoints(spec: ModelSpec, config: dict, images_dir: Path, labels_dir: Path, names: list[str]):
+    """YOLO pose labels: 'class cx cy w h' then 'x y' or 'x y visibility' per keypoint, all normalised to 0-1."""
+    import numpy as np
+    from PIL import Image
+
+    shape = config.get("kpt_shape")
+    image_paths, annotations = [], {}
+    num_keypoints = int(shape[0]) if shape else 0
+    for image_path in sorted(path for path in images_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES):
+        label_path = labels_dir / (image_path.stem + ".txt")
+        rows = []
+        if label_path.is_file():
+            rows = [line.split() for line in label_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with Image.open(image_path) as image:
+            width, height = image.size
+        xy, visible, class_id, area = [], [], [], []
+        for row in rows:
+            values = np.asarray(row, dtype=np.float64)
+            points = values[5:]
+            if not num_keypoints:
+                num_keypoints = len(points) // 3 if len(points) % 3 == 0 else len(points) // 2
+            dims = int(shape[1]) if shape else len(points) // num_keypoints
+            if len(points) != num_keypoints * dims:
+                raise ConfigError(f"[{spec.name}] {label_path}: expected {num_keypoints} keypoints x {dims} values, got {len(points)} values")
+            points = points.reshape(num_keypoints, dims)
+            pixels = points[:, :2] * [width, height]
+            labelled = points[:, 2] > 0 if dims >= 3 else (points[:, :2] != 0).any(axis=1)
+            if not labelled.any():
+                continue  # nothing to score against
+            xy.append(pixels)
+            visible.append(labelled)
+            class_id.append(int(values[0]))
+            area.append(values[3] * width * values[4] * height * BOX_TO_OBJECT_AREA)
+        image_paths.append(str(image_path))
+        annotations[str(image_path)] = KeypointSet(
+            xy=np.asarray(xy, dtype=np.float32).reshape(-1, num_keypoints, 2),
+            class_id=np.asarray(class_id, dtype=int),
+            visible=np.asarray(visible, dtype=bool).reshape(-1, num_keypoints),
+            area=np.asarray(area, dtype=np.float64),
+        )
+    if not num_keypoints:
+        raise ConfigError(f"[{spec.name}] no keypoint labels found in {labels_dir}; is this a pose dataset?")
+    return KeypointDataset(names, image_paths, annotations, _keypoint_sigmas(spec, num_keypoints))
+
+
+def _load_coco_keypoints(spec: ModelSpec, annotations_path: Path, images_dir: Path):
+    """COCO keypoints: each annotation has 'keypoints' as [x, y, visibility] per keypoint, in pixels."""
+    import numpy as np
+
+    content = json.loads(annotations_path.read_text(encoding="utf-8"))
+    categories = sorted(content.get("categories", []), key=lambda category: category["id"])
+    class_index = {category["id"]: index for index, category in enumerate(categories)}
+    by_image: dict[Any, list] = {}
+    num_keypoints = 0
+    for annotation in content.get("annotations", []):
+        points = annotation.get("keypoints")
+        if not points or annotation.get("iscrowd"):
+            continue
+        num_keypoints = num_keypoints or len(points) // 3
+        by_image.setdefault(annotation["image_id"], []).append(annotation)
+    if not num_keypoints:
+        raise ConfigError(f"[{spec.name}] no 'keypoints' annotations in {annotations_path}; is this a keypoint dataset?")
+
+    image_paths, annotations = [], {}
+    for image in sorted(content.get("images", []), key=lambda image: image["file_name"]):
+        xy, visible, class_id, area = [], [], [], []
+        for annotation in by_image.get(image["id"], []):
+            points = np.asarray(annotation["keypoints"], dtype=np.float64).reshape(-1, 3)
+            if len(points) != num_keypoints or not (points[:, 2] > 0).any():
+                continue  # nothing to score against
+            box_area = annotation["bbox"][2] * annotation["bbox"][3] * BOX_TO_OBJECT_AREA
+            xy.append(points[:, :2])
+            visible.append(points[:, 2] > 0)
+            class_id.append(class_index[annotation["category_id"]])
+            area.append(annotation.get("area") or box_area)
+        path = str(images_dir / image["file_name"])
+        image_paths.append(path)
+        annotations[path] = KeypointSet(
+            xy=np.asarray(xy, dtype=np.float32).reshape(-1, num_keypoints, 2),
+            class_id=np.asarray(class_id, dtype=int),
+            visible=np.asarray(visible, dtype=bool).reshape(-1, num_keypoints),
+            area=np.asarray(area, dtype=np.float64),
+        )
+    names = [str(category["name"]) for category in categories]
+    return KeypointDataset(names, image_paths, annotations, _keypoint_sigmas(spec, num_keypoints))
+
+
 @register_data_format("coco")
-def load_coco_dataset(spec: ModelSpec, masks: bool = False):
+def load_coco_dataset(spec: ModelSpec, task: str = "detection"):
     """COCO layout: one annotations .json, images next to it unless options['images_dir'] says otherwise."""
     import supervision as sv
 
@@ -619,8 +851,10 @@ def load_coco_dataset(spec: ModelSpec, masks: bool = False):
     images_dir = Path(spec.options.get("images_dir") or annotations.parent)
     if not images_dir.is_dir():
         raise ConfigError(f"[{spec.name}] images folder not found: {images_dir}")
+    if task in KEYPOINT_TASKS:
+        return _load_coco_keypoints(spec, annotations, images_dir)
     return sv.DetectionDataset.from_coco(
-        images_directory_path=str(images_dir), annotations_path=str(annotations), force_masks=masks
+        images_directory_path=str(images_dir), annotations_path=str(annotations), force_masks=task == "segmentation"
     )
 
 
@@ -687,7 +921,7 @@ class TaskEvaluator(ABC):
 
     metric_labels: dict[str, str] = {}  # metric key -> display label, in display order (all higher-is-better)
     headline_metric: str = ""  # the metric used for the speed-vs-accuracy view
-    needs_masks: bool = False  # True makes the data loaders read mask annotations
+    task_name: str = ""  # the registered task name; also tells the data loaders which annotations to read
 
     def __init__(self, conf_threshold: float, warmup_runs: int, max_images: int | None):
         self.conf_threshold = conf_threshold
@@ -699,7 +933,7 @@ class TaskEvaluator(ABC):
             raise ConfigError(
                 f"[{spec.name}] unknown data format '{spec.data_format}'. Available: {', '.join(sorted(DATA_FORMATS))}"
             )
-        return DATA_FORMATS[spec.data_format](spec, masks=self.needs_masks)
+        return DATA_FORMATS[spec.data_format](spec, task=self.task_name)
 
     def prepare_output(self, output, adapter: ModelAdapter):
         """Untimed, called once per prediction as it is produced; a task can validate or compact it here."""
@@ -879,7 +1113,6 @@ class SegmentationEvaluator(DetectionEvaluator):
     }
     task_name = "segmentation"
     metric_target = "masks"
-    needs_masks = True
 
     def load_dataset(self, spec: ModelSpec):
         dataset = super().load_dataset(spec)
@@ -901,6 +1134,173 @@ class SegmentationEvaluator(DetectionEvaluator):
         return {"box_map50_95": float(MeanAveragePrecision().update(dense, targets).compute().map50_95)}
 
 
+class OksScorer:
+    """COCO-style keypoint scoring.
+
+    Predictions are matched to ground truth by Object Keypoint Similarity (OKS), the keypoint counterpart of
+    box IoU: 1.0 when every labelled keypoint is exactly right, falling towards 0 as keypoints drift, with the
+    tolerance scaled by the object's size and each keypoint's sigma.
+    """
+
+    THRESHOLDS = [0.5 + 0.05 * step for step in range(10)]  # OKS 0.50 ... 0.95
+
+    def __init__(self, sigmas, max_detections: int | None = None):
+        self.sigmas = sigmas
+        self.max_detections = max_detections  # COCO scores at most 20 keypoint detections per image
+        self.scores: dict[int, list] = {}  # class -> one score array per image
+        self.hits: dict[int, list] = {}  # class -> one (detections, thresholds) bool array per image
+        self.targets: dict[int, int] = {}  # class -> number of ground-truth instances
+
+    def _oks(self, predictions: KeypointSet, targets: KeypointSet):
+        import numpy as np
+
+        distance = ((predictions.xy[:, None].astype(np.float64) - targets.xy[None]) ** 2).sum(axis=-1)  # (D, G, K)
+        error = distance / (2 * self.sigmas) ** 2 / (targets.area[None, :, None] + np.spacing(1)) / 2
+        labelled = targets.visible[None]
+        return (np.exp(-error) * labelled).sum(axis=-1) / np.maximum(labelled.sum(axis=-1), 1)
+
+    def update(self, predictions: KeypointSet, targets: KeypointSet) -> None:
+        import numpy as np
+
+        if len(predictions) and self.max_detections:
+            predictions = predictions[np.argsort(-predictions.score, kind="stable")[: self.max_detections]]
+        if len(predictions) and len(targets) and predictions.xy.shape[1] != targets.xy.shape[1]:
+            raise ConfigError(
+                f"The model predicts {predictions.xy.shape[1]} keypoints but the test set has {targets.xy.shape[1]} per object."
+            )
+        for class_id in set(predictions.class_id.tolist()) | set(targets.class_id.tolist()):
+            class_predictions = predictions[predictions.class_id == class_id]
+            class_targets = targets[targets.class_id == class_id]
+            class_predictions = class_predictions[np.argsort(-class_predictions.score, kind="stable")]
+            hits = np.zeros((len(class_predictions), len(self.THRESHOLDS)), dtype=bool)
+            if len(class_predictions) and len(class_targets):
+                oks = self._oks(class_predictions, class_targets)
+                for column, threshold in enumerate(self.THRESHOLDS):
+                    taken = np.zeros(len(class_targets), dtype=bool)
+                    for row in range(len(class_predictions)):  # best-scoring prediction picks first
+                        candidates = np.where(taken, -1.0, oks[row])
+                        best = int(candidates.argmax())
+                        if candidates[best] >= threshold:
+                            taken[best] = True
+                            hits[row, column] = True
+            self.scores.setdefault(class_id, []).append(class_predictions.score)
+            self.hits.setdefault(class_id, []).append(hits)
+            self.targets[class_id] = self.targets.get(class_id, 0) + len(class_targets)
+
+    def _per_class(self):
+        import numpy as np
+
+        for class_id, total in self.targets.items():
+            if total == 0:
+                continue  # a class with no ground truth has no recall to measure
+            scores = np.concatenate(self.scores[class_id])
+            hits = np.concatenate(self.hits[class_id])
+            yield total, hits[np.argsort(-scores, kind="stable")]
+
+    def mean_average_precision(self) -> tuple[float, float]:
+        """(mAP over OKS 0.50-0.95, mAP at OKS 0.50), using COCO's 101-point interpolation."""
+        import numpy as np
+
+        recall_points = np.linspace(0, 1, 101)
+        per_class = []
+        for total, hits in self._per_class():
+            averages = []
+            for column in range(hits.shape[1]):
+                if not len(hits):
+                    averages.append(0.0)
+                    continue
+                true_positives = np.cumsum(hits[:, column])
+                recall = true_positives / total
+                precision = true_positives / np.arange(1, len(hits) + 1)
+                precision = np.maximum.accumulate(precision[::-1])[::-1]  # precision envelope
+                index = np.searchsorted(recall, recall_points, side="left")
+                sampled = np.where(index < len(precision), precision[np.minimum(index, len(precision) - 1)], 0.0)
+                averages.append(float(sampled.mean()))
+            per_class.append(averages)
+        if not per_class:
+            return 0.0, 0.0
+        table = np.asarray(per_class)
+        return float(table.mean()), float(table[:, 0].mean())
+
+    def precision_recall_f1(self) -> tuple[float, float, float]:
+        """Macro-averaged precision, recall and F1 at OKS 0.50."""
+        import numpy as np
+
+        rows = []
+        for total, hits in self._per_class():
+            true_positives = int(hits[:, 0].sum())
+            precision = true_positives / len(hits) if len(hits) else 0.0
+            recall = true_positives / total
+            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+            rows.append((precision, recall, f1))
+        if not rows:
+            return 0.0, 0.0, 0.0
+        precision, recall, f1 = np.asarray(rows).mean(axis=0)
+        return float(precision), float(recall), float(f1)
+
+
+@register_task("keypoint")
+class KeypointEvaluator(TaskEvaluator):
+    """Keypoint detection / pose estimation, scored with OKS the way COCO does."""
+
+    metric_labels = {
+        "map50_95": "Keypoint mAP50-95",
+        "map50": "Keypoint mAP50",
+        "precision": "Precision",
+        "recall": "Recall",
+        "f1": "F1",
+    }
+    headline_metric = "map50_95"
+    task_name = "keypoint"
+    MAP_CONF = 0.001
+    MAX_DETECTIONS = 20
+
+    def evaluate(self, adapter: ModelAdapter, dataset) -> EvalResult:
+        image_paths = list(dataset.image_paths)
+        if self.max_images:
+            image_paths = image_paths[: self.max_images]
+        if not image_paths:
+            raise ConfigError(f"[{adapter.spec.name}] the test set contains no images")
+        targets = [dataset.annotations[path] for path in image_paths]
+        aligner = ClassAligner(adapter.class_names, list(dataset.classes))
+
+        # Pass 1, timed, at the operating confidence. Gives precision / recall / F1.
+        outputs, times_ms, forward_ms = self._run_pass(
+            adapter, image_paths, self.conf_threshold, f"timed pass (conf {self.conf_threshold})", timed=True
+        )
+        operating = OksScorer(dataset.sigmas)
+        for output, target in zip(outputs, targets):
+            operating.update(aligner(output), target)
+        # Pass 2, untimed, at a very low confidence for mAP.
+        outputs, _, _ = self._run_pass(adapter, image_paths, self.MAP_CONF, "mAP pass", timed=False)
+        dense = OksScorer(dataset.sigmas, self.MAX_DETECTIONS)
+        for output, target in zip(outputs, targets):
+            dense.update(aligner(output), target)
+
+        map50_95, map50 = dense.mean_average_precision()
+        precision, recall, f1 = operating.precision_recall_f1()
+        return EvalResult(
+            model_name=adapter.spec.name,
+            architecture=adapter.spec.architecture,
+            task=self.task_name,
+            device=adapter.device,
+            num_images=len(image_paths),
+            metrics={"map50_95": map50_95, "map50": map50, "precision": precision, "recall": recall, "f1": f1},
+            timing=summarise_times(times_ms, forward_ms),
+            image_names=[Path(path).name for path in image_paths],
+            per_image_ms=times_ms,
+            per_image_forward_ms=forward_ms,
+            notes=aligner.notes(),
+        )
+
+
+@register_task("pose")
+class PoseEvaluator(KeypointEvaluator):
+    """'pose' is another name for the keypoint task."""
+
+    task_name = "pose"
+
+
 def _register_planned_task(name: str, hint: str) -> None:
     """Reserve a task name so selecting it gives a clear message instead of 'unknown task'."""
 
@@ -916,8 +1316,6 @@ def _register_planned_task(name: str, hint: str) -> None:
             raise NotImplementedError
 
 
-_register_planned_task("pose", "score sv.KeyPoints predictions with OKS-based mAP against keypoint ground truth.")
-_register_planned_task("keypoint", "score sv.KeyPoints predictions with OKS-based mAP against keypoint ground truth.")
 _register_planned_task(
     "classification", "add a folder-per-class data format and report top-1 / top-5 accuracy from the model's probabilities."
 )
