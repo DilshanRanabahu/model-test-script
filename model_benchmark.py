@@ -72,13 +72,33 @@ class ModelSpec:
     options: dict[str, Any] = field(default_factory=dict)
 
 
-# ======================================================================================================
-# USER SETTINGS - edit this block
-# ======================================================================================================
+######################################################################################################
+######################################################################################################
+##
+##   USER CONFIGURATION  -  START
+##
+##   This is the only part of the file you need to edit.
+##     STEP 1  Main switches      what to run
+##     STEP 2  Models and data    which weights and test sets
+##     STEP 3  Run options        device, thresholds, output (the defaults are fine)
+##
+######################################################################################################
+######################################################################################################
 
-TASK = "keypoint"  # "detection", "segmentation", "keypoint" (same as "pose"); "classification" is an extension point
-BENCHMARK = True  # True: evaluate every model in MODELS and draw the comparison chart. False: SINGLE_MODEL only
+# ======================================== STEP 1: MAIN SWITCHES ========================================
+# TASK          "detection", "segmentation" or "keypoint" (same as "pose"). "classification" is not built yet.
+# BENCHMARK     True  = run every model for the task and draw the comparison chart.
+#               False = run one model only (SINGLE_MODEL) and print its results; no chart.
+# SINGLE_MODEL  the name="..." of the model to run when BENCHMARK is False; None = the first model in the list.
+#               Trial names:  detection     "YOLO11n"       "RF-DETR Nano"
+#                             segmentation  "YOLO11n-seg"   "RF-DETR Seg Nano"
+#                             keypoint      "YOLO11n-pose"  "RF-DETR Keypoint"
+TASK = "segmentation"
+BENCHMARK = True
+SINGLE_MODEL = "YOLO11n"
 
+# ======================================= STEP 2: MODELS AND DATA =======================================
+# One list per task; the script uses the list that matches TASK.
 # Trial setup: pretrained nano models on the small Ultralytics sample datasets (4 test images each).
 # Replace the weights and data paths below with your own trained models and test sets.
 SAMPLES = r"C:\Users\DilshanR\Desktop\Thullex\datasets"
@@ -152,8 +172,7 @@ KEYPOINT_MODELS = [
 # MODELS follows TASK automatically.
 MODELS = {"segmentation": SEGMENTATION_MODELS, "keypoint": KEYPOINT_MODELS, "pose": KEYPOINT_MODELS}.get(TASK, DETECTION_MODELS)
 
-SINGLE_MODEL = MODELS[0].name  # name of the model to run when BENCHMARK is False
-
+# ========================================= STEP 3: RUN OPTIONS =========================================
 DEVICE = "auto"  # "auto", "cpu", "cuda", "cuda:0"
 CONF_THRESHOLD = 0.25  # operating confidence: used for precision / recall / F1 and for the timed pass
 NMS_IOU = 0.7  # NMS IoU for architectures that use NMS (YOLO); RF-DETR is NMS-free
@@ -161,6 +180,14 @@ WARMUP_RUNS = 5  # untimed predictions before timing starts
 MAX_IMAGES = None  # e.g. 50 for a quick trial run; None uses the whole test set
 OUTPUT_DIR = "results"
 SHOW_PLOT = True  # open the saved benchmark.png in the default image viewer
+
+######################################################################################################
+######################################################################################################
+##
+##   USER CONFIGURATION  -  END          (nothing below this line needs editing)
+##
+######################################################################################################
+######################################################################################################
 
 # ======================================================================================================
 # TERMINAL OUTPUT
@@ -297,7 +324,8 @@ class Console:
         print(line(header))
         for title, section in sections:
             print(rule(box["ml"], box["mm"], box["mr"]))
-            print(line([(title, "bold", "cyan")] + [""] * (len(header) - 1)))
+            if title:
+                print(line([(title, "bold", "cyan")] + [""] * (len(header) - 1)))
             for row in section:
                 print(line(row))
         print(rule(box["bl"], box["bm"], box["br"]))
@@ -360,7 +388,7 @@ def check_dependencies(architectures: set[str], need_plot: bool) -> None:
     print()
     console.table(
         ["Library", "Required", "Status"],
-        [("Missing or outdated", [[package, f">= {minimum}", (status, "red")] for package, minimum, status in problems])],
+        [("", [[package, f">= {minimum}", (status, "red")] for package, minimum, status in problems])],
         left={0, 1, 2},
     )
     print("\nInstall them with:\n")
