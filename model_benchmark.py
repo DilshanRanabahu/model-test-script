@@ -20,6 +20,7 @@ Nothing else in the file needs to change.
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
 import re
@@ -45,7 +46,7 @@ class ModelSpec:
 
     name:         label used in the report and the chart.
     architecture: a registered architecture ("yolo", "rfdetr").
-    weights:      path to the trained weights file.
+    weights:      path to the trained weights file: .pt / .pth, or an exported .onnx model.
     data_path:    test data for this model. YOLO format: the data.yaml (or its folder).
                   COCO format: the annotations .json (or the folder holding _annotations.coco.json).
     data_format:  a registered data format ("yolo", "coco").
@@ -61,6 +62,9 @@ class ModelSpec:
                                 resolution              inference resolution
                                 optimize                True to call optimize_for_inference()
                                 trust_checkpoint        True to allow full-pickle loading of a trusted checkpoint
+                    rfdetr .onnx                            detection only; set class_names (a list, {id: name}, or
+                                                            "coco" for a COCO-pretrained model), because an RF-DETR
+                                                            ONNX file does not carry the class names
     """
 
     name: str
@@ -90,9 +94,9 @@ class ModelSpec:
 # BENCHMARK     True  = run every model for the task and draw the comparison chart.
 #               False = run one model only (SINGLE_MODEL) and print its results; no chart.
 # SINGLE_MODEL  the name="..." of the model to run when BENCHMARK is False; None = the first model in the list.
-#               Trial names:  detection     "YOLO11n"       "RF-DETR Nano"
-#                             segmentation  "YOLO11n-seg"   "RF-DETR Seg Nano"
-#                             keypoint      "YOLO11n-pose"  "RF-DETR Keypoint"
+#               Trial names:  detection     "YOLO11n"  "RF-DETR Nano"  "YOLO11n ONNX"  "RF-DETR Nano ONNX"
+#                             segmentation  "YOLO11n-seg"   "RF-DETR Seg Nano"  "YOLO11n-seg ONNX"
+#                             keypoint      "YOLO11n-pose"  "RF-DETR Keypoint"  "YOLO11n-pose ONNX"
 TASK = "segmentation"
 BENCHMARK = True
 SINGLE_MODEL = "YOLO11n"
@@ -104,6 +108,7 @@ SINGLE_MODEL = "YOLO11n"
 SAMPLES = r"C:\Users\DilshanR\Desktop\Thullex\datasets"
 SAMPLE_YAMLS = r"C:\Users\DilshanR\AppData\Local\Programs\Python\Python312\Lib\site-packages\ultralytics\cfg\datasets"
 ROBOFLOW_WEIGHTS = r"C:\Users\DilshanR\.roboflow\models"
+ONNX_MODELS = str(Path(__file__).parent / "onnx_models")  # the trial models exported to ONNX
 
 COCO8_YAML = SAMPLE_YAMLS + r"\coco8.yaml"
 COCO8_DIRS = {"images_dir": SAMPLES + r"\coco8\images\val", "labels_dir": SAMPLES + r"\coco8\labels\val"}
@@ -129,6 +134,22 @@ DETECTION_MODELS = [
         data_format="yolo",
         options={"variant": "RFDETRNano", **COCO8_DIRS},
     ),
+    ModelSpec(
+        name="YOLO11n ONNX",
+        architecture="yolo",
+        weights=ONNX_MODELS + r"\yolo11n.onnx",
+        data_path=COCO8_YAML,
+        data_format="yolo",
+        options=COCO8_DIRS,
+    ),
+    ModelSpec(
+        name="RF-DETR Nano ONNX",
+        architecture="rfdetr",
+        weights=ONNX_MODELS + r"\rfdetr-nano.onnx",
+        data_path=COCO8_YAML,
+        data_format="yolo",
+        options={"class_names": "coco", **COCO8_DIRS},  # an RF-DETR .onnx file has no class names inside
+    ),
 ]
 
 SEGMENTATION_MODELS = [
@@ -148,6 +169,14 @@ SEGMENTATION_MODELS = [
         data_format="yolo",
         options={"variant": "RFDETRSegNano", **COCO8_SEG_DIRS},
     ),
+    ModelSpec(
+        name="YOLO11n-seg ONNX",
+        architecture="yolo",
+        weights=ONNX_MODELS + r"\yolo11n-seg.onnx",
+        data_path=COCO8_SEG_YAML,
+        data_format="yolo",
+        options=COCO8_SEG_DIRS,
+    ),
 ]
 
 KEYPOINT_MODELS = [
@@ -166,6 +195,14 @@ KEYPOINT_MODELS = [
         data_path=COCO8_POSE_YAML,
         data_format="yolo",
         options={"variant": "RFDETRKeypointPreview", **COCO8_POSE_DIRS},
+    ),
+    ModelSpec(
+        name="YOLO11n-pose ONNX",
+        architecture="yolo",
+        weights=ONNX_MODELS + r"\yolo11n-pose.onnx",
+        data_path=COCO8_POSE_YAML,
+        data_format="yolo",
+        options=COCO8_POSE_DIRS,
     ),
 ]
 
@@ -354,6 +391,7 @@ REQUIRED = [
     Requirement(("matplotlib",), "3.7.0", "plot"),
     Requirement(("ultralytics",), "8.3.0", "yolo"),
     Requirement(("rfdetr",), "1.2.0", "rfdetr"),
+    Requirement(("onnxruntime-gpu", "onnxruntime"), "1.16.0", "onnx"),  # only when a model is a .onnx file
 ]
 
 
@@ -516,6 +554,23 @@ class ModelAdapter(ABC):
         self.nms_iou = nms_iou
         self.model = None
         self.color: str | None = None  # terminal colour for this model's progress bar, set by the Evaluator
+        self.onnx = _is_onnx(spec.weights)
+        self.notes: list[str] = []  # anything about this run the report should mention
+
+    @property
+    def device_label(self) -> str:
+        """The device shown in the report; ONNX adapters report the provider ONNX Runtime actually used."""
+        return self.device
+
+    def _named_classes(self, default) -> dict[int, str]:
+        """Class id -> name from options['class_names'] (a list or an {id: name} dict), else from `default`."""
+        names = self.spec.options.get("class_names") or default
+        if isinstance(names, str) and names == "coco":
+            # Shortcut for COCO-pretrained RF-DETR models, whose ids follow the 91-entry COCO numbering.
+            from rfdetr.assets.coco_classes import COCO_CLASSES as names
+        if isinstance(names, dict):
+            return {int(index): str(name) for index, name in names.items()}
+        return {index: str(name) for index, name in enumerate(names)}
 
     @abstractmethod
     def load(self) -> None:
@@ -549,6 +604,15 @@ class ModelAdapter(ABC):
 
             torch.cuda.synchronize()
 
+    def unload(self) -> None:
+        """Release the model from RAM and GPU memory once it has been evaluated."""
+        self.model = None
+        gc.collect()
+        if self.device.startswith("cuda"):
+            import torch
+
+            torch.cuda.empty_cache()
+
     def _weights_path(self) -> str:
         path = Path(self.spec.weights)
         if path.is_file():
@@ -556,6 +620,37 @@ class ModelAdapter(ABC):
         if self.spec.options.get("allow_download"):
             return self.spec.weights
         raise ConfigError(f"[{self.spec.name}] weights file not found: {self.spec.weights}")
+
+
+def _is_onnx(weights) -> bool:
+    return str(weights).lower().endswith(".onnx")
+
+
+ONNX_CPU_NOTE = (
+    "ONNX Runtime could not use the GPU (its CUDA provider did not load; it needs CUDA/cuDNN versions that match "
+    "the installed onnxruntime-gpu), so this model ran on the CPU."
+)
+
+
+def _open_onnx_session(weights: str, device: str):
+    """Open an ONNX Runtime session on the requested device. Returns (session, True if it really runs on CUDA).
+
+    ONNX Runtime silently falls back to the CPU when its CUDA provider cannot load, so the result is checked.
+    """
+    import onnxruntime as ort
+
+    wanted = ["CUDAExecutionProvider", "CPUExecutionProvider"] if device.startswith("cuda") else ["CPUExecutionProvider"]
+    providers = [provider for provider in wanted if provider in ort.get_available_providers()]
+    session = ort.InferenceSession(weights, providers=providers)
+    return session, session.get_providers()[0] == "CUDAExecutionProvider"
+
+
+def _onnx_device_label(session, requested: str) -> str:
+    """'cuda (onnx)' or 'cpu (onnx)', from the provider the ONNX Runtime session is really using."""
+    try:
+        return "cuda (onnx)" if session.get_providers()[0].startswith(("CUDA", "Tensorrt")) else "cpu (onnx)"
+    except Exception:
+        return f"{requested} (onnx)"
 
 
 def _object_array(values):
@@ -571,17 +666,34 @@ def _object_array(values):
 class YoloAdapter(ModelAdapter):
     supported_tasks = {"detection", "segmentation", "pose", "keypoint", "classification"}
 
+    ULTRALYTICS_TASKS = {"detection": "detect", "segmentation": "segment", "keypoint": "pose", "pose": "pose", "classification": "classify"}  # fmt: skip
+
     def load(self) -> None:
         from ultralytics import YOLO
 
-        self.model = YOLO(self._weights_path())
+        if self.onnx:
+            if self.device.startswith("cuda"):
+                # Ultralytics feeds GPU tensors to the session, which fails if ONNX Runtime fell back to the CPU.
+                session, on_cuda = _open_onnx_session(self._weights_path(), self.device)
+                del session
+                if not on_cuda:
+                    self.device = "cpu"
+                    self.notes.append(ONNX_CPU_NOTE)
+            # An exported model cannot tell Ultralytics which head it has, so the task is passed explicitly.
+            self.model = YOLO(self._weights_path(), task=self.ULTRALYTICS_TASKS[self.task])
+        else:
+            self.model = YOLO(self._weights_path())
+
+    @property
+    def device_label(self) -> str:
+        if not self.onnx:
+            return self.device
+        session = getattr(getattr(getattr(self.model, "predictor", None), "model", None), "session", None)
+        return _onnx_device_label(session, self.device)
 
     @property
     def class_names(self) -> dict[int, str]:
-        override = self.spec.options.get("class_names")
-        if override:
-            return dict(enumerate(override))
-        return {int(index): str(name) for index, name in self.model.names.items()}
+        return self._named_classes(self.model.names)
 
     def predict(self, prepared, conf: float):
         kwargs = {"conf": conf, "iou": self.nms_iou, "device": self.device, "verbose": False}
@@ -620,7 +732,13 @@ class YoloAdapter(ModelAdapter):
 class RFDETRAdapter(ModelAdapter):
     supported_tasks = {"detection", "segmentation", "keypoint", "pose"}
 
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
     def load(self) -> None:
+        if self.onnx:
+            self._load_onnx()
+            return
         import rfdetr
 
         options = self.spec.options
@@ -639,10 +757,58 @@ class RFDETRAdapter(ModelAdapter):
         if options.get("optimize"):
             self.model.optimize_for_inference()
 
+    def _load_onnx(self) -> None:
+        """Open an RF-DETR model exported with model.export(); it then runs on ONNX Runtime, not PyTorch."""
+        if self.task != "detection":
+            raise ConfigError(
+                f"[{self.spec.name}] RF-DETR .onnx models are supported for task 'detection' only; "
+                f"use the .pth checkpoint for task '{self.task}'."
+            )
+        self.model, on_cuda = _open_onnx_session(self._weights_path(), self.device)
+        if self.device.startswith("cuda") and not on_cuda:
+            self.device = "cpu"
+            self.notes.append(ONNX_CPU_NOTE)
+        model_input = self.model.get_inputs()[0]
+        height, width = model_input.shape[2], model_input.shape[3]
+        if not isinstance(height, int) or not isinstance(width, int):
+            raise ConfigError(f"[{self.spec.name}] the ONNX model has no fixed input size; export it with a static shape")
+        self._onnx_input, self._onnx_size = model_input.name, (height, width)
+        names = [output.name for output in self.model.get_outputs()]
+        if "dets" not in names or "labels" not in names:
+            raise ConfigError(f"[{self.spec.name}] expected RF-DETR ONNX outputs 'dets' and 'labels', found {names}")
+        self._onnx_outputs = ["dets", "labels"]
+
+    @property
+    def device_label(self) -> str:
+        return _onnx_device_label(self.model, self.device) if self.onnx else self.device
+
+    def _predict_onnx(self, image_rgb, conf: float):
+        """Resize + normalise, run the session, and decode boxes: the same steps RFDETR.predict() performs."""
+        import cv2
+        import numpy as np
+        import supervision as sv
+
+        original_height, original_width = image_rgb.shape[:2]
+        height, width = self._onnx_size
+        resized = cv2.resize(image_rgb, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        tensor = ((resized - self.IMAGENET_MEAN) / self.IMAGENET_STD).astype(np.float32).transpose(2, 0, 1)[None]
+        boxes, logits = self.model.run(self._onnx_outputs, {self._onnx_input: tensor})
+        boxes, logits = boxes[0], logits[0, :, :-1]  # (Q, 4) normalised cxcywh; the last logit is "no object"
+
+        # RF-DETR scores every (query, class) pair with a sigmoid and keeps the top Q pairs.
+        scores = 1.0 / (1.0 + np.exp(-np.clip(logits, -88, 88)))
+        flat = scores.ravel()
+        top = np.argsort(-flat, kind="stable")[: len(boxes)]
+        top = top[flat[top] > conf]
+        query, class_id = top // scores.shape[1], top % scores.shape[1]
+        cx, cy, box_width, box_height = boxes[query].T
+        xyxy = np.stack([cx - box_width / 2, cy - box_height / 2, cx + box_width / 2, cy + box_height / 2], axis=1)
+        xyxy = (xyxy * [original_width, original_height, original_width, original_height]).astype(np.float32)
+        return sv.Detections(xyxy=xyxy.reshape(-1, 4), confidence=flat[top].astype(np.float32), class_id=class_id.astype(int))
+
     @property
     def class_names(self) -> dict[int, str]:
-        names = self.spec.options.get("class_names") or self.model.class_names
-        return dict(enumerate(names))
+        return self._named_classes([] if self.onnx else self.model.class_names)
 
     def prepare(self, image_bgr):
         import cv2
@@ -650,6 +816,8 @@ class RFDETRAdapter(ModelAdapter):
         return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)  # RF-DETR expects RGB
 
     def predict(self, prepared, conf: float):
+        if self.onnx:
+            return self._predict_onnx(prepared, conf)
         kwargs = {"threshold": conf, "include_source_image": False}
         resolution = self.spec.options.get("resolution")
         if resolution:
@@ -1039,7 +1207,8 @@ class ClassAligner:
     def notes(self) -> list[str]:
         notes = []
         if self.identity:
-            notes.append("No class names in common between model and dataset: class ids were matched as-is.")
+            notes.append("No class names in common between model and dataset, so class ids were matched as-is. If the scores "
+                "look wrong, give the model's class names with options={'class_names': [...]} on its ModelSpec.")
             return notes
         if self.dropped:
             notes.append(
@@ -1104,14 +1273,14 @@ class DetectionEvaluator(TaskEvaluator):
             model_name=adapter.spec.name,
             architecture=adapter.spec.architecture,
             task=self.task_name,
-            device=adapter.device,
+            device=adapter.device_label,
             num_images=len(image_paths),
             metrics=metrics,
             timing=summarise_times(times_ms, forward_ms),
             image_names=[Path(path).name for path in image_paths],
             per_image_ms=times_ms,
             per_image_forward_ms=forward_ms,
-            notes=aligner.notes(),
+            notes=aligner.notes() + adapter.notes,
         )
 
 
@@ -1311,14 +1480,14 @@ class KeypointEvaluator(TaskEvaluator):
             model_name=adapter.spec.name,
             architecture=adapter.spec.architecture,
             task=self.task_name,
-            device=adapter.device,
+            device=adapter.device_label,
             num_images=len(image_paths),
             metrics={"map50_95": map50_95, "map50": map50, "precision": precision, "recall": recall, "f1": f1},
             timing=summarise_times(times_ms, forward_ms),
             image_names=[Path(path).name for path in image_paths],
             per_image_ms=times_ms,
             per_image_forward_ms=forward_ms,
-            notes=aligner.notes(),
+            notes=aligner.notes() + adapter.notes,
         )
 
 
@@ -1687,31 +1856,41 @@ class Evaluator:
         return self.device
 
     def _evaluate_model(self, spec: ModelSpec, evaluator: TaskEvaluator, dataset, device: str, color: str) -> EvalResult:
-        import torch
-
+        # Whatever happens, the model is released from memory before the next one is loaded.
         adapter = ARCHITECTURES[spec.architecture](spec, self.task, device, self.nms_iou)
         adapter.color = color
+        result = None
         try:
             adapter.load()
-            return evaluator.evaluate(adapter, dataset)
+            result = evaluator.evaluate(adapter, dataset)
         except RuntimeError as error:
             if not (device.startswith("cuda") and _is_out_of_memory(error)):
                 raise
-        # The GPU ran out of memory: free it and repeat the whole evaluation on the CPU.
+        finally:
+            adapter.unload()
+        if result is not None:
+            console.step("model released from memory")
+            return result
+        # The GPU ran out of memory: repeat the whole evaluation on the CPU.
         print()
         console.warn(f"[{spec.name}] GPU out of memory; re-running on the CPU.")
-        del adapter
-        torch.cuda.empty_cache()
         adapter = ARCHITECTURES[spec.architecture](spec, self.task, "cpu", self.nms_iou)
         adapter.color = color
-        adapter.load()
-        result = evaluator.evaluate(adapter, dataset)
+        try:
+            adapter.load()
+            result = evaluator.evaluate(adapter, dataset)
+        finally:
+            adapter.unload()
+        console.step("model released from memory")
         result.notes.append("Ran on the CPU because the GPU ran out of memory.")
         return result
 
     def run(self) -> list[EvalResult]:
         specs = self._selected_models()
-        check_dependencies({spec.architecture for spec in specs}, need_plot=self.benchmark)
+        needed = {spec.architecture for spec in specs}
+        if any(_is_onnx(spec.weights) for spec in specs):
+            needed.add("onnx")
+        check_dependencies(needed, need_plot=self.benchmark)
         self._validate(specs)
         evaluator_cls = TASKS[self.task]
         evaluator = evaluator_cls(self.conf_threshold, self.warmup_runs, self.max_images)
